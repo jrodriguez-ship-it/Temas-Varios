@@ -25,7 +25,8 @@ Uso recomendado (con la foto modelo guardada en el disco):
 Requisitos:
     pip install opencv-python pillow numpy
 Opcionales (mejoran mucho la precision):
-    pip install ultralytics mediapipe pillow-heif
+    pip install ultralytics          # muy recomendado: detector bueno
+    pip install pillow-heif          # solo si tienes fotos .HEIC del iPhone
 """
 
 import argparse
@@ -62,49 +63,39 @@ def _cargar_detectores():
     """
     Carga una sola vez por proceso.
 
-    Personas: YOLOv8n (ultralytics) y, si no esta, el HOG de OpenCV.
-    Caras:    MediaPipe y, si no esta, las cascadas Haar de OpenCV.
+    Preferido: YOLOv8n-pose. Da los 17 puntos del cuerpo, entre ellos nariz,
+    ojos y orejas, asi que dice directamente si cada persona mira a camara o
+    esta de espaldas. Es mas fiable que detectar caras por separado.
 
-    Ojo: OpenCV 5 elimino tanto HOGDescriptor como las cascadas Haar incluidas,
-    asi que ahi los respaldos no existen y hacen falta ultralytics/mediapipe.
+    Respaldo: HOG (personas) + cascadas Haar (caras) de OpenCV. Ojo: OpenCV 5
+    elimino los dos, asi que ahi este respaldo no existe.
     """
     if _detectores:
         return _detectores
 
-    _detectores["modo_personas"] = None
-    _detectores["modo_caras"] = None
+    _detectores["modo"] = None
 
     try:
         from ultralytics import YOLO
-        _detectores["yolo"] = YOLO("yolov8n.pt")
-        _detectores["modo_personas"] = "yolo"
+        _detectores["pose"] = YOLO("yolov8n-pose.pt")
+        _detectores["modo"] = "pose"
+        return _detectores
     except Exception:
-        try:
-            hog = cv2.HOGDescriptor()
-            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            _detectores["hog"] = hog
-            _detectores["modo_personas"] = "hog"
-        except Exception:
-            pass
+        pass
 
     try:
-        import mediapipe as mp
-        _detectores["mp"] = mp.solutions.face_detection.FaceDetection(
-            model_selection=1, min_detection_confidence=0.4)
-        _detectores["modo_caras"] = "mediapipe"
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        base = cv2.data.haarcascades
+        frontal = cv2.CascadeClassifier(base + "haarcascade_frontalface_default.xml")
+        perfil = cv2.CascadeClassifier(base + "haarcascade_profileface.xml")
+        if not frontal.empty():
+            _detectores["hog"] = hog
+            _detectores["frontal"] = frontal
+            _detectores["perfil"] = perfil
+            _detectores["modo"] = "clasico"
     except Exception:
-        try:
-            base = cv2.data.haarcascades
-            frontal = cv2.CascadeClassifier(
-                base + "haarcascade_frontalface_default.xml")
-            perfil = cv2.CascadeClassifier(
-                base + "haarcascade_profileface.xml")
-            if not frontal.empty():
-                _detectores["frontal"] = frontal
-                _detectores["perfil"] = perfil
-                _detectores["modo_caras"] = "haar"
-        except Exception:
-            pass
+        pass
 
     return _detectores
 
@@ -112,63 +103,74 @@ def _cargar_detectores():
 def verificar_entorno():
     """Comprueba que haya detectores utilizables ANTES de recorrer el disco."""
     d = _cargar_detectores()
-    faltan = []
-    if d["modo_personas"] is None:
-        faltan.append("detector de personas")
-    if d["modo_caras"] is None:
-        faltan.append("detector de caras")
-
-    if faltan:
+    if d["modo"] is None:
         sys.exit(
-            "No hay " + " ni ".join(faltan) + " disponible.\n\n"
+            "No hay detectores disponibles.\n\n"
             "Tu version de OpenCV (" + cv2.__version__ + ") no incluye los\n"
-            "respaldos clasicos (HOG y cascadas Haar se eliminaron en OpenCV 5).\n\n"
-            "Instala los detectores buenos:\n"
-            "    pip install ultralytics mediapipe\n\n"
+            "respaldos clasicos: HOG y las cascadas Haar se eliminaron en OpenCV 5.\n\n"
+            "Instala el detector bueno (recomendado):\n"
+            "    pip install ultralytics\n\n"
             "O baja OpenCV a la serie 4, que si trae los respaldos:\n"
             '    pip install "opencv-python<5"\n'
         )
-    return d["modo_personas"], d["modo_caras"]
+    return d["modo"]
 
 
-def detectar_personas(img):
-    """Devuelve cajas (x, y, w, h) de personas."""
+# Indices de los puntos del cuerpo en el formato COCO
+NARIZ, OJO_IZQ, OJO_DER, OREJA_IZQ, OREJA_DER = 0, 1, 2, 3, 4
+CONF_PUNTO = 0.5
+
+
+def _centro_dentro(caja_chica, caja_grande):
+    x, y, w, h = caja_chica
+    cx, cy = x + w / 2, y + h / 2
+    X, Y, W, H = caja_grande
+    return X <= cx <= X + W and Y <= cy <= Y + H
+
+
+def analizar_personas(img):
+    """
+    Devuelve una lista con una entrada por persona:
+        {"caja": (x, y, w, h), "mira_a_camara": bool}
+    """
     d = _cargar_detectores()
-    if d["modo_personas"] == "yolo":
-        res = d["yolo"].predict(img, classes=[0], conf=0.35, verbose=False)
-        cajas = []
-        for r in res:
-            for b in r.boxes.xyxy.cpu().numpy():
-                x1, y1, x2, y2 = b[:4]
-                cajas.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
-        return cajas
 
+    if d["modo"] == "pose":
+        personas = []
+        for r in d["pose"].predict(img, conf=0.35, verbose=False):
+            if r.keypoints is None or r.keypoints.conf is None:
+                continue
+            cajas = r.boxes.xyxy.cpu().numpy()
+            confs = r.keypoints.conf.cpu().numpy()
+            for caja, kp in zip(cajas, confs):
+                x1, y1, x2, y2 = caja[:4]
+                # Si se le ve la nariz, o los dos ojos, esta mirando hacia aca.
+                # De espaldas solo suelen quedar visibles hombros y orejas.
+                mira = (kp[NARIZ] > CONF_PUNTO or
+                        (kp[OJO_IZQ] > CONF_PUNTO and kp[OJO_DER] > CONF_PUNTO))
+                personas.append({
+                    "caja": (int(x1), int(y1), int(x2 - x1), int(y2 - y1)),
+                    "mira_a_camara": bool(mira),
+                })
+        return personas
+
+    # Respaldo clasico: personas por un lado, caras por otro, y se cruzan
     rects, _ = d["hog"].detectMultiScale(img, winStride=(8, 8),
                                          padding=(8, 8), scale=1.05)
-    return [tuple(int(v) for v in r) for r in rects]
+    gris = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    caras = [tuple(int(v) for v in c) for c in
+             d["frontal"].detectMultiScale(gris, 1.1, 5, minSize=(30, 30))]
+    caras += [tuple(int(v) for v in c) for c in
+              d["perfil"].detectMultiScale(gris, 1.1, 5, minSize=(30, 30))]
 
-
-def detectar_caras(img):
-    """Devuelve (cajas_frontales, cajas_de_perfil)."""
-    d = _cargar_detectores()
-    if d["modo_caras"] == "mediapipe":
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        res = d["mp"].process(rgb)
-        alto, ancho = img.shape[:2]
-        frontales = []
-        for det in (res.detections or []):
-            c = det.location_data.relative_bounding_box
-            frontales.append((int(c.xmin * ancho), int(c.ymin * alto),
-                              int(c.width * ancho), int(c.height * alto)))
-        return frontales, []
-
-    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gris = cv2.equalizeHist(gris)
-    frontales = [tuple(int(v) for v in r) for r in
-                 d["frontal"].detectMultiScale(gris, 1.1, 5, minSize=(30, 30))]
-    perfiles = [tuple(int(v) for v in r) for r in
-                d["perfil"].detectMultiScale(gris, 1.1, 5, minSize=(30, 30))]
-    return frontales, perfiles
+    personas = []
+    for r in rects:
+        caja = tuple(int(v) for v in r)
+        personas.append({
+            "caja": caja,
+            "mira_a_camara": any(_centro_dentro(c, caja) for c in caras),
+        })
+    return personas
 
 
 # --------------------------------------------------------------------------
@@ -252,33 +254,31 @@ def _centro_dentro(caja_chica, caja_grande):
     return X <= cx <= X + W and Y <= cy <= Y + H
 
 
-def puntuar(personas, frontales, perfiles):
+def puntuar(personas):
     """
     0 a 100. Alto = probablemente varias personas de espaldas.
-    Premia: >=2 personas, ninguna cara, y alturas distintas (adulto + nino).
+    Premia: >=2 de espaldas, nadie mirando a camara, y alturas distintas
+    (patron adulto + nino).
     """
     if len(personas) < 2:
         return 0, "menos de 2 personas"
 
-    con_cara = sum(
-        1 for p in personas
-        if any(_centro_dentro(c, p) for c in frontales + perfiles)
-    )
-    de_espaldas = len(personas) - con_cara
-    if de_espaldas < 2:
-        return 0, f"{con_cara} con cara visible"
+    mirando = [p for p in personas if p["mira_a_camara"]]
+    de_espaldas = [p for p in personas if not p["mira_a_camara"]]
+    if len(de_espaldas) < 2:
+        return 0, f"{len(mirando)} mirando a camara"
 
     puntaje = 55
-    razones = [f"{de_espaldas} personas sin cara visible"]
+    razones = [f"{len(de_espaldas)} de espaldas"]
 
-    if not frontales and not perfiles:
+    if not mirando:
         puntaje += 25
-        razones.append("ninguna cara en la foto")
+        razones.append("nadie mirando a camara")
     else:
-        puntaje -= 12 * len(frontales) + 5 * len(perfiles)
+        puntaje -= 12 * len(mirando)
+        razones.append(f"{len(mirando)} mirando a camara")
 
-    # adulto + nino: dos figuras principales de altura claramente distinta
-    alturas = sorted((p[3] for p in personas), reverse=True)[:2]
+    alturas = sorted((p["caja"][3] for p in de_espaldas), reverse=True)[:2]
     if len(alturas) == 2 and alturas[0] > 0:
         razon = alturas[1] / alturas[0]
         if 0.45 <= razon <= 0.85:
@@ -333,23 +333,22 @@ def procesar(ruta):
     except Exception as e:
         return {"ruta": ruta, "error": str(e), "puntaje": 0}
 
-    personas = detectar_personas(img)
-    frontales, perfiles = detectar_caras(img)
-    puntaje, motivo = puntuar(personas, frontales, perfiles)
+    personas = analizar_personas(img)
+    puntaje, motivo = puntuar(personas)
 
     humedad = 0.0
     if personas and puntaje > 0:
-        # se evalua sobre la persona mas grande (el adulto)
-        adulto = max(personas, key=lambda p: p[2] * p[3])
-        humedad = mancha_humeda(img, adulto)
+        # se evalua sobre la persona de espaldas mas grande (el adulto)
+        adulto = max((p for p in personas if not p["mira_a_camara"]),
+                     key=lambda p: p["caja"][2] * p["caja"][3])
+        humedad = mancha_humeda(img, adulto["caja"])
 
     return {
         "ruta": ruta,
         "carpeta": os.path.dirname(ruta),
         "puntaje": puntaje,
         "personas": len(personas),
-        "caras_frontales": len(frontales),
-        "caras_perfil": len(perfiles),
+        "de_espaldas": sum(1 for p in personas if not p["mira_a_camara"]),
         "mancha_humeda": humedad,
         "similitud": similitud(img, _REFERENCIA) if puntaje > 0 else 0.0,
         "motivo": motivo,
@@ -419,8 +418,7 @@ def main():
         sys.exit(f"No existe la ruta: {args.ruta}")
     os.makedirs(args.salida, exist_ok=True)
 
-    modo_p, modo_c = verificar_entorno()
-    print(f"Detectores: personas={modo_p}, caras={modo_c}")
+    print(f"Detector: {verificar_entorno()}")
 
     ref = None
     if args.referencia:
@@ -473,7 +471,7 @@ def main():
     candidatos.sort(key=orden)
 
     campos = ["puntaje", "similitud", "mancha_humeda", "ruta", "carpeta",
-              "personas", "caras_frontales", "caras_perfil", "fecha", "motivo"]
+              "personas", "de_espaldas", "fecha", "motivo"]
     with open(os.path.join(args.salida, "candidatos.csv"), "w",
               newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")

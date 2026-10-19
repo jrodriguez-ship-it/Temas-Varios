@@ -8,10 +8,12 @@ están**, para que vayas directo a buscarlas.
 
 Recorre todo el disco, y por cada imagen:
 
-1. Detecta **personas**.
-2. Detecta **caras**.
-3. Si hay 2 o más personas y **ninguna cara visible**, la marca como candidata.
-4. Sube el puntaje si las dos figuras principales tienen alturas distintas
+1. Detecta **personas** y los puntos de su cuerpo (nariz, ojos, orejas,
+   hombros…) con YOLO-pose.
+2. Si a una persona **no se le ve ni la nariz ni los dos ojos**, está de
+   espaldas.
+3. Si hay 2 o más personas de espaldas, la foto es candidata.
+4. Sube el puntaje si las dos figuras de espaldas tienen alturas distintas
    (patrón adulto + niño).
 
 Y opcionalmente:
@@ -25,14 +27,17 @@ Y opcionalmente:
 
 ```bash
 pip install opencv-python pillow numpy
-pip install ultralytics mediapipe          # muy recomendado: mucho mejor precisión
+pip install ultralytics                    # muy recomendado
 pip install pillow-heif                    # solo si tienes fotos .HEIC del iPhone
 ```
 
-**Importante:** si tienes OpenCV 5, `ultralytics` y `mediapipe` no son
-opcionales. OpenCV 5 eliminó los detectores clásicos (HOG y las cascadas Haar),
-así que sin ellos el programa no tiene con qué detectar. El script te lo avisa
-al arrancar, antes de ponerse a recorrer el disco.
+La primera vez, `ultralytics` descarga solo el modelo `yolov8n-pose.pt`
+(6,5 MB). De ahí en adelante trabaja sin internet.
+
+**Importante:** si tienes OpenCV 5, `ultralytics` **no es opcional**. OpenCV 5
+eliminó los detectores clásicos (HOG y las cascadas Haar), así que sin él el
+programa no tiene con qué detectar. El script te lo avisa al arrancar, antes de
+ponerse a recorrer el disco.
 
 ## Uso
 
@@ -64,7 +69,7 @@ En la carpeta de resultados:
 | Archivo | Para qué sirve |
 |---|---|
 | `carpetas.csv` | **Lo que pediste:** ranking de carpetas por cantidad de candidatas |
-| `candidatos.csv` | Cada foto candidata con su puntaje, ruta, fecha y motivo |
+| `candidatos.csv` | Cada foto candidata: puntaje, ruta, fecha, cuántas personas de espaldas y por qué |
 | `hoja_001.jpg`, … | Mosaicos de 24 fotos para revisar de un vistazo |
 | `cache.json` | Permite cortar el escaneo y reanudarlo después sin repetir trabajo |
 
@@ -89,9 +94,13 @@ Además imprime en pantalla las 20 carpetas con más candidatas.
   retoma donde iba gracias a `cache.json`.
 - **El filtro de humedad es aproximado**, no un veredicto. Mide qué parte del
   torso se ve claramente más oscura que el resto de la prenda. Con ropa
-  estampada o con sombra fuerte se equivoca. Úsalo para ordenar, y decide tú
-  mirando las hojas de contacto.
+  estampada o con luz y sombra fuertes se equivoca: probándolo contra una foto
+  real, marcó 0,27 de "humedad" en un abrigo de piel perfectamente seco, solo
+  por el contraste de la luz. Úsalo para ordenar, y decide tú mirando las hojas
+  de contacto.
 - **Velocidad:** con YOLO, del orden de 10–30 fotos por segundo según el equipo.
   Unas 50.000 fotos es cosa de una o dos horas.
+- **Detección verificada** sobre fotos reales: en una escena de calle con cuatro
+  personas, clasificó bien las cuatro (dos mirando a cámara, dos de espaldas).
 - **Da falsos positivos**, a propósito. Prefiere mostrarte de más a que se te
   escape la foto que buscas. Por eso existen los mosaicos.
